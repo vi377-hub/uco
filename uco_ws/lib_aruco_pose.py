@@ -1,51 +1,89 @@
+"""Nhận diện ArUco và ước lượng pose tương đối (mét)."""
+
 import cv2
-import time
 import cv2.aruco as aruco
 import numpy as np
-from picamera2 import Picamera2
 
-# =====================================================================
-# LỚP NHẬN DIỆN VÀ ƯỚC LƯỢNG VỊ TRÍ ARUCO (Hệ Mét)
-# =====================================================================
+
 class ArucoPoseEstimator:
-    def __init__(self, marker_size_m: float, dictionary_name: str = 'DICT_6X6_250',
-                 fx: float = 800.0, cam_width: int = 640, cam_height: int = 480,
-                 camera_matrix_file: str = None, dist_coeffs_file: str = None):
-        self.marker_size_m = marker_size_m
-        self.aruco_dict = aruco.getPredefinedDictionary(getattr(aruco, dictionary_name))
+
+    def __init__(
+        self,
+        marker_size_m: float,
+        dictionary_name: str = "DICT_6X6_250",
+        cam_width: int = 640,
+        cam_height: int = 480,
+        camera_matrix_file: str | None = None,
+        dist_coeffs_file: str | None = None,
+        input_color: str = "BGR",
+        max_reprojection_error_px: float = 5.0,
+    ):
+        if marker_size_m <= 0:
+            raise ValueError("marker_size_m phải lớn hơn 0")
+        if input_color not in {"RGB", "BGR"}:
+            raise ValueError("input_color chỉ được là 'RGB' hoặc 'BGR'")
+        if not camera_matrix_file or not dist_coeffs_file:
+            raise RuntimeError(" thiếu camera matrix và distortion coefficients")
+
+        try:
+            dictionary_id = getattr(aruco, dictionary_name)
+        except AttributeError as exc:
+            raise ValueError(f"Không tồn tại ArUco dictionary: {dictionary_name}") from exc
+
+        self.marker_size_m = float(marker_size_m)
+        self.input_color = input_color
+        self.max_reprojection_error_px = float(max_reprojection_error_px)
+        self.aruco_dict = aruco.getPredefinedDictionary(dictionary_id)
         self.parameters = self._make_parameters()
 
-        if camera_matrix_file and dist_coeffs_file:
-            try:
-                self.camera_matrix = np.loadtxt(camera_matrix_file, delimiter=',', dtype=np.float64)
-                self.dist_coeffs = np.loadtxt(dist_coeffs_file, delimiter=',', dtype=np.float64).reshape(-1, 1)
-                print("Đã load file calibration thành công.")
-            except Exception as e:
-                print(f"Lỗi load calibration, dùng ước lượng. Chi tiết: {e}")
-                self._use_fallback_calib(fx, cam_width, cam_height)
-        else:
-            self._use_fallback_calib(fx, cam_width, cam_height)
+        try:
+            self.camera_matrix = np.loadtxt(
+                camera_matrix_file, delimiter=",", dtype=np.float64
+            )
+            self.dist_coeffs = np.loadtxt(
+                dist_coeffs_file, delimiter=",", dtype=np.float64
+            ).reshape(-1, 1)
+        except Exception as exc:
+            raise RuntimeError(f"Không thể load calibration: {exc}") from exc
 
-        half = marker_size_m / 2.0
-        self.obj_points = np.array([
-            [-half,  half, 0],
-            [ half,  half, 0],
-            [ half, -half, 0],
-            [-half, -half, 0],
-        ], dtype=np.float64)
+        self._validate_calibration(cam_width, cam_height)
 
-    def _use_fallback_calib(self, fx, w, h):
-        cx, cy = w / 2.0, h / 2.0
-        self.camera_matrix = np.array([
-            [fx, 0, cx],
-            [0, fx, cy],
-            [0, 0, 1]
-        ], dtype=np.float64)
-        self.dist_coeffs = np.zeros((5, 1))
+        half = self.marker_size_m / 2.0
+
+        self.obj_points = np.array(
+            [
+                [-half, half, 0.0],
+                [half, half, 0.0],
+                [half, -half, 0.0],
+                [-half, -half, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+    def _validate_calibration(self, width: int, height: int) -> None:
+        if self.camera_matrix.shape != (3, 3):
+            raise RuntimeError(
+                f"cameraMatrix phải có shape (3, 3), nhận được {self.camera_matrix.shape}"
+            )
+        if self.dist_coeffs.size not in {4, 5, 8, 12, 14}:
+            raise RuntimeError(
+                f"distCoeffs phải có 4/5/8/12/14 hệ số, nhận được {self.dist_coeffs.size}"
+            )
+        if not np.isfinite(self.camera_matrix).all() or not np.isfinite(self.dist_coeffs).all():
+            raise RuntimeError("Calibration chứa NaN hoặc Inf")
+
+        fx = self.camera_matrix[0, 0]
+        fy = self.camera_matrix[1, 1]
+        cx = self.camera_matrix[0, 2]
+        cy = self.camera_matrix[1, 2]
+        if fx <= 0 or fy <= 0:
+            raise RuntimeError("fx và fy phải lớn hơn 0")
+        if not (0 <= cx <= width and 0 <= cy <= height):
+            raise RuntimeError("Tâm quang học nằm ngoài kích thước ảnh cấu hình")
 
     @staticmethod
     def _make_parameters():
-        if hasattr(aruco, 'DetectorParameters_create'):
+        if hasattr(aruco, "DetectorParameters_create"):
             params = aruco.DetectorParameters_create()
         else:
             params = aruco.DetectorParameters()
@@ -54,132 +92,99 @@ class ArucoPoseEstimator:
         params.adaptiveThreshWinSizeMax = 23
         params.adaptiveThreshWinSizeStep = 10
         params.adaptiveThreshConstant = 7
-        params.minMarkerPerimeterRate = 0.02   
+        params.minMarkerPerimeterRate = 0.02
         params.maxMarkerPerimeterRate = 4.0
         params.polygonalApproxAccuracyRate = 0.05
-        if hasattr(aruco, 'CORNER_REFINE_SUBPIX'):
+        if hasattr(aruco, "CORNER_REFINE_SUBPIX"):
             params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
             params.cornerRefinementWinSize = 5
             params.cornerRefinementMaxIterations = 30
             params.cornerRefinementMinAccuracy = 0.1
         return params
 
-    def detect(self, frame_bgr):
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict, parameters=self.parameters)
+    def detect(self, frame):
+        color_code = cv2.COLOR_RGB2GRAY if self.input_color == "RGB" else cv2.COLOR_BGR2GRAY
+        gray = cv2.cvtColor(frame, color_code)
+        corners, ids, _ = aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.parameters
+        )
 
         detections = []
         if ids is None:
             return detections
 
         for marker_corners, marker_id in zip(corners, ids):
-            pts = marker_corners.reshape(-1, 2).astype(np.float32)
-            obj_pts = self.obj_points.astype(np.float32)
-            ok, rvec, tvec = cv2.solvePnP(obj_pts, pts, self.camera_matrix, self.dist_coeffs)
-            if not ok:
+            image_points = marker_corners.reshape(-1, 2).astype(np.float32)
+            ok, rvec, tvec = cv2.solvePnP(
+                self.obj_points,
+                image_points,
+                self.camera_matrix,
+                self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE,
+            )
+            if not ok or not np.isfinite(rvec).all() or not np.isfinite(tvec).all():
                 continue
-            detections.append({
-                'id': int(marker_id[0]),
-                'x_m': float(tvec[0][0]),
-                'y_m': float(tvec[1][0]),
-                'z_m': float(tvec[2][0]),
-                'corners': marker_corners,
-                'rvec': rvec,
-                'tvec': tvec,
-            })
 
-        detections.sort(key=lambda d: d['z_m'])
+            x_m, y_m, z_m = (float(value) for value in tvec.reshape(3))
+            if z_m <= 0:
+                continue
+
+            projected, _ = cv2.projectPoints(
+                self.obj_points, rvec, tvec, self.camera_matrix, self.dist_coeffs
+            )
+            projected = projected.reshape(-1, 2)
+            reprojection_error_px = float(
+                np.mean(np.linalg.norm(projected - image_points, axis=1))
+            )
+            if reprojection_error_px > self.max_reprojection_error_px:
+                continue
+
+            detections.append(
+                {
+                    "id": int(marker_id[0]),
+                    "x_m": x_m,
+                    "y_m": y_m,
+                    "z_m": z_m,
+                    "reprojection_error_px": reprojection_error_px,
+                    "area_px": float(abs(cv2.contourArea(image_points))),
+                    "corners": marker_corners,
+                    "rvec": rvec,
+                    "tvec": tvec,
+                }
+            )
+
+        detections.sort(key=lambda detection: detection["z_m"])
         return detections
 
-    def draw_debug(self, frame_bgr, detections):
-        for det in detections:
-            aruco.drawDetectedMarkers(frame_bgr, [det['corners']], np.array([[det['id']]]))
-            cv2.drawFrameAxes(frame_bgr, self.camera_matrix, self.dist_coeffs,
-                               det['rvec'], det['tvec'], self.marker_size_m / 2)
-            corner0 = det['corners'].reshape(-1, 2)[0]
-            text = f"ID:{det['id']} X:{det['x_m']:.2f} Y:{det['y_m']:.2f} Z:{det['z_m']:.2f}m"
-            cv2.putText(frame_bgr, text, (int(corner0[0]), int(corner0[1]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2, cv2.LINE_AA)
-        return frame_bgr
-
-
-# =====================================================================
-# CHƯƠNG TRÌNH CHÍNH (CAMERA LÔNG GHÉP NHẬN DIỆN)
-# =====================================================================
-if __name__ == "__main__":
-    # 1. Khởi tạo Camera
-    picam2 = Picamera2()
-    
-    # Dùng BGR888 để OpenCV hiển thị màu chuẩn (không bị mặt người xanh lè)
-    config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
-    picam2.configure(config)
-    picam2.start()
-
-    print("Thiết lập control camera (focus/exposure/AWB khoá cứng)...")
-    picam2.set_controls({
-        "AeEnable": False,
-        "ExposureTimeMode": 1,
-        "ExposureTime": 16000,
-        "Sharpness": 2,
-        "Contrast": 0.7,
-        "AnalogueGainMode": 1,
-        "NoiseReductionMode": 0,
-        "AnalogueGain": 2.0,
-        "FrameDurationLimits": (15000, 15000), # Fix max FPS ở mức ổn định ~66fps
-        "AfMode": 0, 
-        "LensPosition": 1.0, # Khoá nét thủ công ở 1 mét
-        "AwbEnable": True,   
-    })
-    time.sleep(0.5)  # Đợi control áp dụng ổn định
-
-    # 2. Khởi tạo bộ nhận diện ArUco
-    # Thay đổi kích thước này (marker_size_m) đúng với cạnh của mã ArUco(VD: 0.1m = 10cm)
-    estimator = ArucoPoseEstimator(
-        marker_size_m=0.27,  
-        dictionary_name='DICT_6X6_250',
-        cam_width=640,
-        cam_height=480,
-        camera_matrix_file='cameraMatrix.txt', 
-        dist_coeffs_file='cameraDistortion.txt'
-    )
-
-    prev_time = time.time()
-    scanned_ids = set()
-
-    print("Bắt đầu luồng camera realtime. Bấm phím 'q' trên cửa sổ để thoát.")
-    try:
-        while True:
-            # Chụp ảnh thẳng từ RAM
-            frame = picam2.capture_array()
-            
-            # Tính toán FPS
-            current_time = time.time()
-            fps = 1.0 / (current_time - prev_time)
-            prev_time = current_time
-
-            # Phát hiện ArUco
-            detections = estimator.detect(frame)
-            for det in detections:
-                if det['id'] not in scanned_ids:
-                    scanned_ids.add(det['id'])
-                    print(f"Đã phát hiện mã mới: {det['id']} ở khoảng cách {det['z_m']:.2f}m")
-
-            # Vẽ bounding box, trục tọa độ và text
-            estimator.draw_debug(frame, detections)
-
-            # Vẽ FPS lên góc trái khung hình
-            cv2.putText(frame, f"FPS: {fps:.1f}", (20, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            # Hiển thị
-            cv2.imshow("Pi5 - ArUco Workspace Realtime", frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("Đã nhận lệnh thoát.")
-                break
-    finally:
-        # Giải phóng tài nguyên camera dù có lỗi văng code hay tắt bằng phím Q
-        picam2.stop()
-        cv2.destroyAllWindows()
-        print("Đã đóng camera thành công.")
-        print(f"Tổng số mã ArUco đã thấy trong phiên: {len(scanned_ids)} -> {sorted(scanned_ids)}")
+    def draw_debug(self, frame, detections):
+        for detection in detections:
+            aruco.drawDetectedMarkers(
+                frame,
+                [detection["corners"]],
+                np.array([[detection["id"]]], dtype=np.int32),
+            )
+            cv2.drawFrameAxes(
+                frame,
+                self.camera_matrix,
+                self.dist_coeffs,
+                detection["rvec"],
+                detection["tvec"],
+                self.marker_size_m / 2.0,
+            )
+            corner = detection["corners"].reshape(-1, 2)[0]
+            label = (
+                f"ID:{detection['id']} X:{detection['x_m']:.2f} "
+                f"Y:{detection['y_m']:.2f} Z:{detection['z_m']:.2f}m "
+                f"E:{detection['reprojection_error_px']:.1f}px"
+            )
+            cv2.putText(
+                frame,
+                label,
+                (int(corner[0]), int(corner[1]) - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        return frame
