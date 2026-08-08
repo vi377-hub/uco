@@ -2,7 +2,7 @@
     Mission -> khóa ArUco gần nhất -> OFFBOARD -> căn tâm/hover 5 s
     -> Mission.
     Nếu phi công chọn mode khác, dừng gửi
-    setpoint và không tự đổi mode trở lại.
+    setpoint, nhường quyền điều khiển cho pilot.
 """
 
 from __future__ import annotations
