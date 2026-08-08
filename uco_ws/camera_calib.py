@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 
 import cv2
 import numpy as np
@@ -6,15 +5,13 @@ import os
 import time
 from picamera2 import Picamera2
 
-# =====================================================
-# ============== THÔNG SỐ CẦN CHỈNH ====================
-# =====================================================
 
-SQUARES_X = 7                 # TODO
-SQUARES_Y = 5                 # TODO
 
-SQUARE_LENGTH = 0.0388           # TODO (m)
-MARKER_LENGTH = 0.0197        # TODO (m)
+SQUARES_X = 7                 
+SQARES_Y = 5                 
+
+SQUARE_LENGTH = 0.0388           # (m)
+MARKER_LENGTH = 0.0197        # (m)
 
 ARUCO_DICT = cv2.aruco.DICT_6X6_250
 
