@@ -1,221 +1,142 @@
-#!/usr/bin/env python3
+"""
+Quy ước camera:
+    - Camera úp xuống, cạnh trên ảnh hướng về đuôi drone.
+    - x_m dương: marker nằm bên phải ảnh, tức bên trái drone.
+    - y_m dương: marker nằm phía dưới ảnh, tức phía trước drone.
+"""
+
+from __future__ import annotations
+
 import argparse
+import logging
+from pathlib import Path
+import threading
 import time
+
 import cv2
-import cv2.aruco as aruco
-import numpy as np
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
 from picamera2 import Picamera2
 
-# =====================================================================
-# LỚP NHẬN DIỆN VÀ ƯỚC LƯỢNG VỊ TRÍ ARUCO (Hệ Mét)
-# =====================================================================
-class ArucoPoseEstimator:
-    def __init__(self, marker_size_m: float, dictionary_name: str = 'DICT_6X6_250',
-                 fx: float = 800.0, cam_width: int = 640, cam_height: int = 480,
-                 camera_matrix_file: str = None, dist_coeffs_file: str = None):
-        self.marker_size_m = marker_size_m
-        self.aruco_dict = aruco.getPredefinedDictionary(getattr(aruco, dictionary_name))
-        self.parameters = self._make_parameters()
-
-        # ==========================================================
-        # LOAD CAMERA CALIBRATION (BẮT BUỘC)
-        # ==========================================================
-        if not camera_matrix_file or not dist_coeffs_file:
-            raise RuntimeError(
-                "Không truyền đường dẫn cameraMatrix hoặc cameraDistortion."
-            )
-
-        try:
-            self.camera_matrix = np.loadtxt(
-                camera_matrix_file,
-                delimiter=',',
-                dtype=np.float64
-            )
-
-            self.dist_coeffs = np.loadtxt(
-                dist_coeffs_file,
-                delimiter=',',
-                dtype=np.float64
-            ).reshape(-1, 1)
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Không thể load calibration: {e}"
-            )
+from lib_aruco_pose import ArucoPoseEstimator
 
 
-        # ==========================================================
-        # VERIFY CAMERA MATRIX
-        # ==========================================================
+LOGGER = logging.getLogger("aruco_camera")
 
-        if self.camera_matrix.shape != (3, 3):
-            raise RuntimeError(
-                f"cameraMatrix phải có kích thước (3,3), nhận được {self.camera_matrix.shape}"
-            )
 
-        if self.dist_coeffs.ndim != 2:
-            raise RuntimeError(
-                "distCoeffs sai định dạng."
-            )
+class ArucoCamera:
 
-        if np.isnan(self.camera_matrix).any():
-            raise RuntimeError(
-                "cameraMatrix chứa NaN."
-            )
+    def __init__(
+        self,
+        marker_size_m: float,
+        dictionary_name: str = "DICT_6X6_250",
+        cam_width: int = 640,
+        cam_height: int = 480,
+        camera_matrix_file: str = "cameraMatrix.txt",
+        dist_coeffs_file: str = "cameraDistortion.txt",
+        max_reprojection_error_px: float = 5.0,
+        confirm_frames_required: int = 3,
+        target_rate_hz: float = 20.0,
+        show_debug: bool = False,
+        logger: logging.Logger | None = None,
+    ):
+        if confirm_frames_required < 1:
+            raise ValueError("confirm_frames_required phải >= 1")
+        if target_rate_hz <= 0:
+            raise ValueError("target_rate_hz phải > 0")
 
-        if np.isnan(self.dist_coeffs).any():
-            raise RuntimeError(
-                "distCoeffs chứa NaN."
-            )
-        if np.isinf(self.camera_matrix).any():
-            raise RuntimeError("cameraMatrix chứa Inf")
+        self.logger = logger or LOGGER
+        self.cam_width = int(cam_width)
+        self.cam_height = int(cam_height)
+        self.show_debug = bool(show_debug)
+        self.confirm_frames_required = int(confirm_frames_required)
+        self.frame_period_sec = 1.0 / float(target_rate_hz)
 
-        if np.isinf(self.dist_coeffs).any():
-            raise RuntimeError("distCoeffs chứa Inf")
+        self.estimator = ArucoPoseEstimator(
+            marker_size_m=marker_size_m,
+            dictionary_name=dictionary_name,
+            cam_width=self.cam_width,
+            cam_height=self.cam_height,
+            camera_matrix_file=camera_matrix_file,
+            dist_coeffs_file=dist_coeffs_file,
+            input_color="BGR",
+            max_reprojection_error_px=max_reprojection_error_px,
+        )
 
-        fx_loaded = self.camera_matrix[0, 0]
-        fy_loaded = self.camera_matrix[1, 1]
+        self.picam2: Picamera2 | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._latest_detections: list[dict] = []
+        self._latest_frame_time = 0.0
+        self._last_error: str | None = None
+        self._consecutive_counts: dict[int, int] = {}
+        self._logged_ids: set[int] = set()
+        self._last_error_log_time = 0.0
 
-        if fx_loaded <= 0 or fy_loaded <= 0:
-            raise RuntimeError(
-                "fx hoặc fy không hợp lệ."
-            )
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
 
-        cx = self.camera_matrix[0, 2]
-        cy = self.camera_matrix[1, 2]
-
-        if not (0 <= cx <= cam_width):
-            raise RuntimeError("cx nằm ngoài ảnh.")
-
-        if not (0 <= cy <= cam_height):
-            raise RuntimeError("cy nằm ngoài ảnh.")
-
-        print("✓ Camera calibration hợp lệ.")
-        half = marker_size_m / 2.0
-        self.obj_points = np.array([
-            [-half,  half, 0],
-            [ half,  half, 0],
-            [ half, -half, 0],
-            [-half, -half, 0],
-        ], dtype=np.float64)
- #haven't used now
-    def _use_fallback_calib(self, fx, w, h):
-        cx, cy = w / 2.0, h / 2.0
-        self.camera_matrix = np.array([
-            [fx, 0, cx],
-            [0, fx, cy],
-            [0, 0, 1]
-        ], dtype=np.float64)
-        self.dist_coeffs = np.zeros((5, 1))
-
-    def _make_parameters(self):
-        if hasattr(aruco, 'DetectorParameters_create'):
-            params = aruco.DetectorParameters_create()
-        else:
-            params = aruco.DetectorParameters()
-
-        params.adaptiveThreshWinSizeMin = 3
-        params.adaptiveThreshWinSizeMax = 23
-        params.adaptiveThreshWinSizeStep = 10
-        params.adaptiveThreshConstant = 7
-        params.minMarkerPerimeterRate = 0.02   
-        params.maxMarkerPerimeterRate = 4.0
-        params.polygonalApproxAccuracyRate = 0.05
-        if hasattr(aruco, 'CORNER_REFINE_SUBPIX'):
-            params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-            params.cornerRefinementWinSize = 5
-            params.cornerRefinementMaxIterations = 30
-            params.cornerRefinementMinAccuracy = 0.1
-        return params
-
-    def detect(self, frame_rgb):
-        # YÊU CẦU ĐỊNH DẠNG: Đổi sang trắng đen từ RGB (vì bạn cấu hình Picamera2 là RGB888)
-        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict, parameters=self.parameters)
-
-        detections = []
-        if ids is None:
-            return detections
-
-        for marker_corners, marker_id in zip(corners, ids):
-            pts = marker_corners.reshape(-1, 2).astype(np.float32)
-            obj_pts = self.obj_points.astype(np.float32)
-            ok, rvec, tvec = cv2.solvePnP(
-                obj_pts,
-                pts,
-                self.camera_matrix,
-                self.dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE
-            )
-            if not ok:
-                continue
-            detections.append({
-                'id': int(marker_id[0]),
-                'x_m': float(tvec[0][0]),
-                'y_m': float(tvec[1][0]),
-                'z_m': float(tvec[2][0]),
-                'corners': marker_corners,
-                'rvec': rvec,
-                'tvec': tvec,
-            })
-
-        detections.sort(key=lambda d: d['z_m'])
-        return detections
-
-    def draw_debug(self, frame_rgb, detections):
-        for det in detections:
-            aruco.drawDetectedMarkers(frame_rgb, [det['corners']], np.array([[det['id']]]))
-            cv2.drawFrameAxes(frame_rgb, self.camera_matrix, self.dist_coeffs,
-                               det['rvec'], det['tvec'], self.marker_size_m / 2)
-            corner0 = det['corners'].reshape(-1, 2)[0]
-            text = f"ID:{det['id']} X:{det['x_m']:.2f} Y:{det['y_m']:.2f} Z:{det['z_m']:.2f}m"
-            cv2.putText(frame_rgb, text, (int(corner0[0]), int(corner0[1]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2, cv2.LINE_AA)
-        return frame_rgb
-
-# =====================================================================
-# ROS 2 PUBLISHER NODE
-# =====================================================================
-class ArucoPublisherNode(Node):
-    def __init__(self, marker_size_m: float, dictionary_name: str,
-                 fx: float, cam_width: int, cam_height: int, show_debug: bool,
-                 camera_matrix_file: str = None, dist_coeffs_file: str = None):
-        super().__init__('aruco_publisher_node')
-
-        self.show_debug = show_debug
-        
-        # Khởi tạo class Estimator
-        try:
-            self.estimator = ArucoPoseEstimator(
-                marker_size_m=marker_size_m,
-                dictionary_name=dictionary_name,
-                fx=fx,
-                cam_width=cam_width,
-                cam_height=cam_height,
-                camera_matrix_file=camera_matrix_file,
-                dist_coeffs_file=dist_coeffs_file,
-            )
-
-        except RuntimeError as e:
-            self.get_logger().fatal(str(e))
-            raise
-
-        # 1. Khởi tạo Picamera2 (Thay thế cv2.VideoCapture)
-        self.get_logger().info("Đang khởi tạo Picamera2...")
+        self.logger.info("Đang khởi tạo Pi Camera...")
         self.picam2 = Picamera2()
-        
-        # Cấu hình RGB888 đúng như yêu cầu
         config = self.picam2.create_preview_configuration(
-            main={"size": (cam_width, cam_height), "format": "RGB888"}
+            main={
+                "size": (self.cam_width, self.cam_height),
+                "format": "RGB888",
+            }
         )
         self.picam2.configure(config)
         self.picam2.start()
+        try:
+            self._configure_camera_controls()
+        except Exception:
+            self.picam2.stop()
+            self.picam2 = None
+            raise
 
-        self.get_logger().info("Thiết lập thông số phơi sáng và lấy nét...")
-        self.picam2.set_controls({
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name="aruco-camera-worker",
+            daemon=True,
+        )
+        self._thread.start()
+        self.logger.info(
+            "Camera ArUco sẵn sàng (%.1f Hz, xác nhận %d frame liên tiếp)",
+            1.0 / self.frame_period_sec,
+            self.confirm_frames_required,
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                self.logger.warning("Luồng camera chưa dừng sau 2 giây")
+            self._thread = None
+
+        if self.picam2 is not None:
+            try:
+                self.picam2.stop()
+            finally:
+                self.picam2 = None
+
+        if self.show_debug:
+            cv2.destroyAllWindows()
+
+    def get_snapshot(self) -> tuple[list[dict], float, str | None]:
+        """Trả về (detections, thời điểm frame, lỗi gần nhất) theo cách thread-safe."""
+        with self._lock:
+            detections = [dict(detection) for detection in self._latest_detections]
+            return detections, self._latest_frame_time, self._last_error
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _configure_camera_controls(self) -> None:
+        if self.picam2 is None:
+            raise RuntimeError("Camera chưa được khởi tạo")
+
+        requested = {
             "AeEnable": False,
             "ExposureTimeMode": 1,
             "ExposureTime": 5000,
@@ -224,123 +145,176 @@ class ArucoPublisherNode(Node):
             "AnalogueGainMode": 1,
             "NoiseReductionMode": 0,
             "AnalogueGain": 3.0,
-            "FrameDurationLimits": (15000, 15000), 
-            "AfMode": 0, 
-            "LensPosition": 1.0, 
-            "AwbEnable": True,   
-        })
-        time.sleep(0.5)
+            "FrameDurationLimits": (15000, 15000),
+            "AfMode": 0,
+            "LensPosition": 1.0,
+            "AwbEnable": True,
+        }
+        available = self.picam2.camera_controls
+        supported = {key: value for key, value in requested.items() if key in available}
+        unsupported = sorted(set(requested) - set(supported))
+        if unsupported:
+            self.logger.warning(
+                "Camera/libcamera không hỗ trợ, bỏ qua: %s",
+                ", ".join(unsupported),
+            )
+        self.picam2.set_controls(supported)
 
-        self.pub = self.create_publisher(Float32MultiArray, '/vision/aruco_pose', 10)
-        self.timer = self.create_timer(0.05, self.loop)  # Chạy 20Hz
+    @staticmethod
+    def describe_position(detection: dict) -> tuple[str, str]:
+        forward_m = float(detection["y_m"])
+        right_m = -float(detection["x_m"])
+        epsilon = 0.02
 
-        # Các biến chống chớp tắt và lọc nhiễu 
-        self.hold_duration_sec = 0.3
-        self.last_detection = None
-        self.last_detection_time = 0.0
-
-        self.confirm_frames_required = 3
-        self.candidate_id = None
-        self.candidate_count = 0
-
-        self.missed_frames = 0
-        self.max_missed_frames = 4
-
-        self.get_logger().info(">>> ARUCO PUBLISHER NODE (PICAMERA2) ĐÃ KHỞI ĐỘNG <<<")
-
-    def loop(self):
-        try:
-            # Bắt frame trực tiếp từ RAM
-            frame = self.picam2.capture_array()
-        except Exception as e:
-            self.get_logger().warn(f"Không lấy được frame từ Picamera2: {e}")
-            return
-
-        detections = self.estimator.detect(frame)
-        now = time.time()
-
-        if detections:
-            self.missed_frames = 0  
-            nearest = detections[0]  
-
-            if nearest['id'] == self.candidate_id:
-                self.candidate_count += 1
-            else:
-                self.candidate_id = nearest['id']
-                self.candidate_count = 1
-
-            if self.candidate_count >= self.confirm_frames_required:
-                self.last_detection = nearest
-                self.last_detection_time = now
+        if forward_m > epsilon:
+            longitudinal = f"phía trước {forward_m:.2f} m"
+        elif forward_m < -epsilon:
+            longitudinal = f"phía sau {abs(forward_m):.2f} m"
         else:
-            self.missed_frames += 1
-            if self.missed_frames > self.max_missed_frames:
-                self.candidate_id = None
-                self.candidate_count = 0
+            longitudinal = "gần ngang tâm theo trục trước/sau"
 
-        # Publish dữ liệu nếu thỏa mãn điều kiện
-        if self.last_detection is not None and (now - self.last_detection_time) < self.hold_duration_sec:
-            d = self.last_detection
-            msg = Float32MultiArray()
-            msg.data = [
-                float(d['id']),
-                d['x_m'],
-                d['y_m'],
-                d['z_m']
-            ]
-            self.pub.publish(msg)
+        if right_m > epsilon:
+            lateral = f"lệch phải {right_m:.2f} m"
+        elif right_m < -epsilon:
+            lateral = f"lệch trái {abs(right_m):.2f} m"
+        else:
+            lateral = "gần ngang tâm theo trục trái/phải"
 
-        if self.show_debug:
-            self.estimator.draw_debug(frame, detections)
-            
-            # Khung hình gốc là RGB, khi hiển thị bằng imshow OpenCV sẽ bị ngược màu (xanh <-> đỏ). 
-            # Đoạn này đổi màu hiển thị trên màn hình thành BGR để không bị đau mắt, 
-            # dữ liệu gốc ở trên vẫn là RGB không ảnh hưởng.
-            display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            cv2.imshow("aruco_publisher_node", display_frame)
-            cv2.waitKey(1)
+        return longitudinal, lateral
 
-    def destroy_node(self):
-        self.picam2.stop()
-        if self.show_debug:
-            cv2.destroyAllWindows()
-        super().destroy_node()
+    def _confirmed_detections(self, detections: list[dict]) -> list[dict]:
+        current_ids = {int(detection["id"]) for detection in detections}
+        for marker_id in list(self._consecutive_counts):
+            if marker_id not in current_ids:
+                del self._consecutive_counts[marker_id]
+
+        confirmed = []
+        for detection in detections:
+            marker_id = int(detection["id"])
+            self._consecutive_counts[marker_id] = (
+                self._consecutive_counts.get(marker_id, 0) + 1
+            )
+            if self._consecutive_counts[marker_id] >= self.confirm_frames_required:
+                confirmed.append(detection)
+        return confirmed
+
+    @staticmethod
+    def _public_detection(detection: dict) -> dict:
+        return {
+            "id": int(detection["id"]),
+            "x_m": float(detection["x_m"]),
+            "y_m": float(detection["y_m"]),
+            "z_m": float(detection["z_m"]),
+            "reprojection_error_px": float(detection["reprojection_error_px"]),
+            "area_px": float(detection["area_px"]),
+        }
+
+    def _store_frame(self, detections: list[dict], now: float) -> None:
+        public_detections = [self._public_detection(item) for item in detections]
+        with self._lock:
+            self._latest_detections = public_detections
+            self._latest_frame_time = now
+            self._last_error = None
+
+    def _store_error(self, exc: Exception, now: float) -> None:
+        message = f"{type(exc).__name__}: {exc}"
+        # Lỗi/cúp frame làm đứt chuỗi xác nhận; không được tính frame sau như thể marker vẫn xuất hiện liên tiếp.
+        self._consecutive_counts.clear()
+        with self._lock:
+            self._latest_detections = []
+            self._latest_frame_time = now
+            self._last_error = message
+
+        if now - self._last_error_log_time >= 2.0:
+            self._last_error_log_time = now
+            self.logger.error("Lỗi camera/nhận dạng: %s", message)
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            loop_start = time.monotonic()
+            try:
+                if self.picam2 is None:
+                    raise RuntimeError("Pi Camera đã bị đóng")
+
+                frame = self.picam2.capture_array()
+                detections = self.estimator.detect(frame)
+                confirmed = self._confirmed_detections(detections)
+                now = time.monotonic()
+                self._store_frame(confirmed, now)
+
+                for detection in confirmed:
+                    marker_id = int(detection["id"])
+                    if marker_id in self._logged_ids:
+                        continue
+                    self._logged_ids.add(marker_id)
+                    longitudinal, lateral = self.describe_position(detection)
+                    self.logger.info(
+                        " ID %d: %s, %s, cách camera %.2f m",
+                        marker_id,
+                        longitudinal,
+                        lateral,
+                        detection["z_m"],
+                    )
+
+                if self.show_debug:
+                    self.estimator.draw_debug(frame, detections)
+                    cv2.imshow("aruco_camera", frame)
+                    cv2.waitKey(1)
+            except Exception as exc:
+                self._store_error(exc, time.monotonic())
+
+            remaining = self.frame_period_sec - (time.monotonic() - loop_start)
+            if remaining > 0:
+                self._stop_event.wait(remaining)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    # Cam-id bị loại bỏ vì đã sử dụng Picamera2 thay cho USB Webcam
-    parser.add_argument('--marker-size', type=float, default=0.27,
-                         help='Kích thước cạnh marker thật, đơn vị MÉT (VD: 0.27)')
-    parser.add_argument('--dictionary', type=str, default='DICT_6X6_250')
-    parser.add_argument('--fx', type=float, default=800.0)
-    parser.add_argument('--width', type=int, default=640)
-    parser.add_argument('--height', type=int, default=480)
-    parser.add_argument('--camera-matrix', type=str, default='cameraMatrix.txt',
-                         help='Đường dẫn file camera matrix')
-    parser.add_argument('--dist-coeffs', type=str, default='cameraDistortion.txt',
-                         help='Đường dẫn file distortion coefficients')
-    parser.add_argument('--no-debug', action='store_true')
-    args, unknown = parser.parse_known_args()
+def _default_calibration_path(filename: str) -> str:
+    return str(Path(__file__).resolve().parent / filename)
 
-    rclpy.init()
-    node = ArucoPublisherNode(
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Thử camera và ArUco độc lập, không cần ROS/PX4"
+    )
+    parser.add_argument("--marker-size", type=float, default=0.27)
+    parser.add_argument("--dictionary", default="DICT_6X6_250")
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument(
+        "--camera-matrix",
+        default=_default_calibration_path("cameraMatrix.txt"),
+    )
+    parser.add_argument(
+        "--dist-coeffs",
+        default=_default_calibration_path("cameraDistortion.txt"),
+    )
+    parser.add_argument("--max-reprojection-error", type=float, default=5.0)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    camera = ArucoCamera(
         marker_size_m=args.marker_size,
         dictionary_name=args.dictionary,
-        fx=args.fx,
         cam_width=args.width,
         cam_height=args.height,
-        show_debug=not args.no_debug,
         camera_matrix_file=args.camera_matrix,
         dist_coeffs_file=args.dist_coeffs,
+        max_reprojection_error_px=args.max_reprojection_error,
+        show_debug=args.debug,
     )
     try:
-        rclpy.spin(node)
+        camera.start()
+        while camera.is_running():
+            time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        camera.stop()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
